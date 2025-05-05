@@ -1,116 +1,115 @@
 import tensorflow as tf
-from tensorflow import keras
-from tensorflow.keras import layers
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.preprocessing import image_dataset_from_directory
+import numpy as np
+from sklearn.model_selection import train_test_split
 import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.metrics import confusion_matrix, accuracy_score
+from sklearn.preprocessing import LabelEncoder
+from tensorflow.keras.utils import to_categorical
+import cv2 as cv
+import os
+import keras_tuner as kt
 
-data_directory = 'C:/Users/dasda/OneDrive/Documents/Defungi'
-image_height = 224
-image_width = 224
-batch_size = 32
-epochs = 15
-validation_split = 0.2 #Use 20% of the data
-num_classes = 5
+# Load data
+base_dir = "extracted_defungi"
+types = os.listdir(base_dir)
 
-train_ds = image_dataset_from_directory(
-    data_directory,
-    validation_split=validation_split,
-    subset="training",
-    seed=123,
-    image_size=(image_height, image_width),
-    batch_size=batch_size,
-    label_mode='categorical'
+def img_extract(image_types):
+    features, Name = [], []
+    for image_type in image_types:
+        type_dir = os.path.join(base_dir, image_type)
+        for i in os.listdir(type_dir):
+            img_path = os.path.join(type_dir, i)
+            img = cv.imread(img_path)
+            img = cv.resize(img, (224, 224)) # Convert to standard input expected by the model
+            features.append(img)
+            Name.append(image_type)
+    return np.array(features), np.array(Name)
+
+features, Name = img_extract(types)
+
+# Encode labels
+label_encoder = LabelEncoder()
+encoded_labels = label_encoder.fit_transform(Name)
+encoded_labels = to_categorical(encoded_labels, num_classes=len(label_encoder.classes_))
+
+# Split data
+X_train, X_test, y_train, y_test = train_test_split(features, encoded_labels, test_size=0.2, random_state=42)
+X_train, X_test = X_train / 255.0, X_test / 255.0  # Normalize
+
+# Model builder function for Keras Tuner
+def model_builder(hp):
+    base_model_name = hp.Choice('base_model', ['ResNet50', 'MobileNetV2', 'EfficientNetB0'])
+
+    base_model_class = {
+        'ResNet50': tf.keras.applications.ResNet50,
+        'MobileNetV2': tf.keras.applications.MobileNetV2,
+        'EfficientNetB0': tf.keras.applications.EfficientNetB0
+    }[base_model_name]
+
+    base_model = base_model_class(include_top=False, weights='imagenet', input_shape=(224, 224, 3))
+    base_model.trainable = False
+
+    x = tf.keras.layers.GlobalAveragePooling2D()(base_model.output)
+    x = tf.keras.layers.Dense(hp.Int('units', min_value=64, max_value=512, step=64), activation='relu')(x)
+    x = tf.keras.layers.Dropout(hp.Float('dropout', 0.2, 0.5, step=0.1))(x)
+    output = tf.keras.layers.Dense(len(label_encoder.classes_), activation='softmax')(x)
+
+    model = tf.keras.Model(inputs=base_model.input, outputs=output)
+
+    model.compile(
+        optimizer=tf.keras.optimizers.Adam(hp.Choice('learning_rate', [1e-2, 1e-3, 1e-4])),
+        loss='categorical_crossentropy',
+        metrics=['accuracy']
+    )
+
+    return model
+
+# Initialize Keras Tuner
+tuner = kt.Hyperband(
+    model_builder,
+    objective='val_accuracy',
+    max_epochs=10,
+    factor=3,
+    directory='fungi_tuner_dir',
+    project_name='fungi_classifier'
 )
 
-val_ds = image_dataset_from_directory(
-    data_directory,
-    validation_split=validation_split,
-    subset="validation",
-    seed=123,
-    image_size=(image_height, image_width),
-    batch_size=batch_size,
-    label_mode='categorical'
-)
+train_ds = tf.data.Dataset.from_tensor_slices((X_train, y_train)).batch(32).prefetch(1)
+val_ds = tf.data.Dataset.from_tensor_slices((X_test, y_test)).batch(32).prefetch(1)
 
+# Search for best hyperparameters
+tuner.search(train_ds, validation_data=val_ds, epochs=10)
 
-class_names = train_ds.class_names
-autotune = tf.data.AUTOTUNE
-train_ds = train_ds.cache().shuffle(1000).prefetch(buffer_size=autotune)
-val_ds = val_ds.cache().prefetch(buffer_size=autotune)
+# Get the best hyperparameters
+best_hps = tuner.get_best_hyperparameters(1)[0]
 
-#Data Augmentation to prevent overfitting
-data_augmentation = Sequential(
-    [
-        layers.RandomFlip("horizontal", input_shape=(image_height, image_width, 3)),
-        layers.RandomRotation(0.1),
-        layers.RandomZoom(0.1),
-        layers.RandomContrast(0.1)
-    ]
-)
+final_model = model_builder(best_hps)
 
-#Using MobileNetV2 but will test other models in the future
-base_model = tf.keras.applications.MobileNetV2(input_shape=(image_height, image_width, 3),
-                                               include_top=False,
-                                               weights='imagenet')
-
-#Freeze the base model
-base_model.trainable = False
-
-inputs = keras.Input(shape=(image_height, image_width, 3))
-x = data_augmentation(inputs)
-x = tf.keras.applications.mobilenet_v2.preprocess_input(x) #Preprocess input
-x = base_model(x, training=False)
-x = layers.GlobalAveragePooling2D()(x)
-x = layers.Dropout(0.2)(x)
-outputs = layers.Dense(num_classes, activation='softmax')(x) #Final layer is softmax
-
-model = keras.Model(inputs, outputs)
-
-model.compile(optimizer='adam',
-              loss='categorical_crossentropy',
-              metrics=['accuracy'])
-
-print("\nModel Summary:")
-model.summary()
-
-history = model.fit(
+# Retrain with best params for 30 epochs
+history = final_model.fit(
     train_ds,
     validation_data=val_ds,
-    epochs=epochs
+    epochs=30
 )
 
-acc = history.history['accuracy']
-val_acc = history.history['val_accuracy']
-loss = history.history['loss']
-val_loss = history.history['val_loss']
+# Predict on test set
+y_pred_final = final_model.predict(X_test)
+y_pred_one_hot_final = np.eye(y_pred_final.shape[1])[np.argmax(y_pred_final, axis=1)]
 
-epochs_range = range(epochs)
+final_accuracy = accuracy_score(y_test, y_pred_one_hot_final)
+print(f"Final test accuracy: {final_accuracy}")
 
-plt.figure(figsize=(12, 6))
-plt.subplot(1, 2, 1)
-plt.plot(epochs_range, acc, label='Training Accuracy')
-plt.plot(epochs_range, val_acc, label='Validation Accuracy')
-plt.legend(loc='lower right')
-plt.title('Training and Validation Accuracy')
-plt.xlabel('Epoch')
-plt.ylabel('Accuracy')
+# Confusion matrix
+def cnfsn_matrix(y_test, y_pred):
+    class_labels = label_encoder.classes_
+    confusion = confusion_matrix(np.argmax(y_test, axis=1), np.argmax(y_pred, axis=1))
+    plt.figure(figsize=(8, 6))
+    sns.heatmap(confusion, annot=True, fmt='d', cmap='Blues',
+                xticklabels=class_labels, yticklabels=class_labels)
+    plt.xlabel('Predicted')
+    plt.ylabel('True')
+    plt.title('Confusion Matrix')
+    plt.show()
 
-
-plt.subplot(1, 2, 2)
-plt.plot(epochs_range, loss, label='Training Loss')
-plt.plot(epochs_range, val_loss, label='Validation Loss')
-plt.legend(loc='upper right')
-plt.title('Training and Validation Loss')
-plt.xlabel('Epoch')
-plt.ylabel('Loss')
-plt.suptitle("Model Training History", fontsize=15)
-plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-plt.show()
-
-final_loss, final_accuracy = model.evaluate(val_ds)
-print(f"Final Validation Loss: {final_loss:}")
-print(f"Final Validation Accuracy: {final_accuracy:}")
-
-
-model.save('fungi_classifier_model.keras')
+cnfsn_matrix(y_test, y_pred_final)
